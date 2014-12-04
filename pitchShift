@@ -1,0 +1,221 @@
+6.111
+=====
+
+final project stuffs
+`timescale 1ns / 1ps
+//////////////////////////////////////////////////////////////////////////////////
+// Company: 
+// Engineer: 
+// 
+// Create Date:    15:58:40 11/27/2014 
+// Design Name: 
+// Module Name:    pitchShift 
+// Project Name: 
+// Target Devices: 
+// Tool versions: 
+// Description: 
+//
+// Dependencies: 
+//
+// Revision: 
+// Revision 0.01 - File Created
+// Additional Comments: 
+//
+//////////////////////////////////////////////////////////////////////////////////
+module pitchShift(
+    input [3:0] pitch,
+    input clock_27M,
+	 input get_next,
+	 input restart,
+    output reg signed [17:0] new_bin_freq,			//the true frequency of the resulting shifted bin
+	 output reg signed [17:0] new_bin_magn,			//the magnitude of the resulting shifted bin
+	 output reg [9:0] new_bin_index					//the index of the shifted bin
+	 );
+
+	reg get_next_delayed;
+	reg [35:0] bin_data;
+	reg [14:0] bin_addr;
+	wire signed [17:0] bin_freq_out, bin_magn_out;									
+	reg signed [17:0] shift_factor;
+	reg [9:0] current_index = 10'b11_1111_1111;
+	reg [35:0] new_index_result;
+	reg [35:0] bin_freq_result;
+	wire [35:0] bin_data_buffer;
+	
+	parameter C = 4'd0;
+	parameter D = 4'd1;
+	parameter E = 4'd2;
+	parameter F = 4'd3;
+	parameter G = 4'd4;
+
+	
+	fftdataMon fft_data(.clka(clock_27M), .addra(bin_addr), .douta(bin_data_buffer));
+	
+	assign bin_freq_out = bin_data[35:18];
+	assign bin_magn_out = bin_data[17:0];
+	
+	always @(*) begin
+		case(pitch)
+			C:	shift_factor = 18'sb01_0000_0000_0000_0000;
+			D: shift_factor = 18'sb01_0011_0011_0011_0011;
+			F: shift_factor = 18'sb01_0100_1100_1100_1100;
+			G: shift_factor = 18'sb01_1000_0000_0000_0000;
+			default: shift_factor = 18'sb01_0000_0000_0000_0000;
+		endcase
+		
+		new_index_result = shift_factor * {8'b0,current_index};
+		new_bin_index = new_index_result[35:16];
+		new_bin_magn = bin_magn_out;
+		bin_freq_result = shift_factor * bin_freq_out;
+		new_bin_freq = bin_freq_result >>> 16;
+		
+	end
+	
+	always @(posedge clock_27M) begin
+		if(restart) begin
+			bin_addr <= 0;
+			current_index <= 10'b11_1111_1111;
+		end
+		else if(get_next & !get_next_delayed) begin
+			bin_data <= bin_data_buffer;
+			bin_addr <= bin_addr + 1;
+			if(current_index == 511) current_index <= 0;
+			else current_index <= current_index + 1;
+		end
+		get_next_delayed <= get_next;
+	end
+endmodule
+
+module shiftManager(
+					input clock_27mhz,
+					input restart,
+					input switch,
+					output reg signed [17:0] bin_deviation,
+					output signed [17:0] frequency,
+					output reg [9:0] addr,
+					output reg we, 
+					output reg write_data,
+					output reg signed [17:0] frequency_deviation,
+					output reg signed [17:0] phase_sum_out_buff,
+					output reg [4:0] counter);
+					
+//	wire we;
+//	reg [8:0] addr;
+	wire [9:0] sample_counter;
+	wire [9:0] index;
+	reg [9:0] last_index;
+	wire [14:0] temp;
+//	wire signed [17:0] frequency;
+	wire signed [17:0] phase_sum_out;
+	reg signed [17:0] phase_sum_in;
+//	reg signed [17:0] phase_sum_out_buff;
+//	reg write_data;
+	reg get_next;
+//	reg counter;
+	reg [17:0] magn_sum_in;
+	wire [17:0] magnitude;
+	wire [17:0] magn_sum_out;
+	reg [17:0] magn_sum_out_buff;
+	reg signed [31:0] shifted_freq;
+//	reg signed [31:0] freq_deviation;
+	reg signed [31:0] center_freq;
+	reg signed [35:0] bin_dev_prod;
+	reg signed [25:0] bin_dev_osamp;
+	reg [13:0] expct_phase_adv;
+	reg signed [17:0] phase;
+	parameter freq_per_bin = 18'sb0_1011_1011;//1; //11.71785
+	parameter freq_per_bin_inv = 18'sb0_00010_1011_1011_0001;
+	parameter pi_one_half = 18'sb01_1001; //oversampling factor && expected phase advance
+	
+	pitchShift pshft(.pitch(4'b0),
+					.clock_27M(clock_27mhz),
+					.get_next(get_next),
+					.restart(restart),
+					.new_bin_freq(frequency),									
+					.new_bin_magn(magnitude),											
+					.new_bin_index(index));
+	
+	ram18x512 magnSumMem(.clka(clock_27mhz),
+								.dina(magn_sum_in),
+								.addra(addr),
+								.wea(write_data),
+								.douta(magn_sum_out));
+								
+	ram21x512 phasSumMem(.clka(clock_27mhz),
+								.dina(phase_sum_in),
+								.addra(addr),
+								.wea(write_data),
+								.douta(phase_sum_out));
+								
+
+	always @(*) begin
+		magn_sum_in = magnitude + magn_sum_out_buff;
+
+		center_freq = freq_per_bin * index;
+		frequency_deviation = frequency - center_freq;
+		bin_dev_prod = frequency_deviation * freq_per_bin_inv;
+		bin_deviation = bin_dev_prod[27:10];
+		bin_dev_osamp = bin_deviation * pi_one_half;
+		expct_phase_adv = index[8:0] * pi_one_half;
+		phase = bin_dev_osamp[24:4] + {expct_phase_adv,7'b0};
+		
+		phase_sum_in = phase + phase_sum_out_buff;
+		get_next = switch & counter == 0;
+		addr = index[8:0];
+		if(we & index < 512) write_data = 1;
+		else write_data = 0;
+	end
+	
+	always @(posedge clock_27mhz) begin
+		if(restart) begin
+			counter <= 0;
+			we <= 0;
+		end
+		if(switch) counter <= counter + 1;
+		if(counter == 28 || counter == 30) we <= ~we;
+		if (index < 512 && switch && counter == 3) begin
+			magn_sum_out_buff <= magn_sum_out;
+			phase_sum_out_buff <= phase_sum_out;
+		end 
+	end
+endmodule
+
+// Switch Debounce Module
+// use your system clock for the clock input
+// to produce a synchronous, debounced output
+module debounce #(parameter DELAY=270000)   // .01 sec with a 27Mhz clock
+	        (input reset, clock, noisy,
+	         output reg clean);
+
+   reg [18:0] count;
+   reg new;
+
+   always @(posedge clock)
+     if (reset)
+       begin
+	  count <= 0;
+	  new <= noisy;
+	  clean <= noisy;
+       end
+     else if (noisy != new)
+       begin
+	  new <= noisy;
+	  count <= 0;
+       end
+     else if (count == DELAY)
+       clean <= new;
+     else
+       count <= count+1;
+      
+endmodule
+
+module clockDivider(input clock_27mhz, input[4:0] numCycles, output enable);
+	reg [4:0] counter;
+	
+	assign enable = (counter == numCycles);
+	
+	always @(posedge clock_27mhz) begin
+		if(counter == numCycles) counter <= 0;
+		else counter <= counter + 1;
+	end
+endmodule
