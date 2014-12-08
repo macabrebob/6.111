@@ -1,0 +1,1227 @@
+`timescale 1ns / 1ps
+//////////////////////////////////////////////////////////////////////////////////
+// Company: 
+// Engineer: 
+// 
+// Create Date:    15:58:40 11/27/2014 
+// Design Name: 
+// Module Name:    pitchShift 
+// Project Name: 
+// Target Devices: 
+// Tool versions: 
+// Description: 
+//
+// Dependencies: 
+//
+// Revision: 
+// Revision 0.01 - File Created
+// Additional Comments: 
+//
+//////////////////////////////////////////////////////////////////////////////////
+module pitchShift(
+    input [3:0] pitch,
+    input clock_27M,
+     input get_next,
+     input restart,
+    output reg signed [31:0] new_bin_freq,          //the true frequency of the resulting shifted bin
+     output reg signed [31:0] new_bin_magn,         //the magnitude of the resulting shifted bin
+     output reg signed [31:0] new_bin_index                 //the index of the shifted bin
+     );
+
+    reg get_next_delayed;
+//  reg [35:0] bin_data;
+    reg [14:0] bin_addr = 0;
+    reg signed [31:0] bin_freq_out, bin_magn_out;                                   
+    reg signed [31:0] shift_factor;
+    reg [31:0] current_index = 32'h1FF_0000;
+    reg [63:0] new_index_result;
+    reg [63:0] bin_freq_result;
+    wire signed [31:0] bin_freq_buffer;
+    wire signed [31:0] bin_magn_buffer;
+    
+    parameter C = 4'd0;
+    parameter D = 4'd1;
+    parameter E = 4'd2;
+    parameter F = 4'd3;
+    parameter G = 4'd4;
+
+    
+//    magn_rom magn_data(.clka(clock_27M), .addra(bin_addr), .douta(bin_magn_buffer));
+//    freq_rom freq_data(.clka(clock_27M), .addra(bin_addr), .douta(bin_freq_buffer));
+    sin440magn magn_data(.clka(clock_27M), .addra(bin_addr), .douta(bin_magn_buffer));
+    sin440freq freq_data(.clka(clock_27M), .addra(bin_addr), .douta(bin_freq_buffer));
+
+//  assign bin_freq_out = bin_data[35:18];
+//  assign bin_magn_out = bin_data[17:0];
+    
+    always @(*) begin
+        case(pitch)
+            C:  shift_factor = 32'sb01_0000_0000_0000_0000;
+            D: shift_factor = 32'sb01_0011_0011_0011_0011;
+            F: shift_factor = 32'sb01_0100_1100_1100_1100;
+            G: shift_factor = 32'sb01_1000_0000_0000_0000;
+            default: shift_factor = 32'sb01_0000_0000_0000_0000;
+        endcase
+        
+        new_index_result = shift_factor * current_index;
+        new_bin_index = new_index_result >>> 16;
+//      new_bin_magn = bin_magn_out;
+        bin_freq_result = shift_factor * bin_freq_out;
+        new_bin_freq = bin_freq_result >>> 16;
+        new_bin_magn = bin_magn_out;
+    end
+    
+    always @(posedge clock_27M) begin
+        if(restart) begin
+            bin_addr <= 0;
+            current_index <= 32'h1FF_0000;
+        end
+        else if(get_next) begin
+            bin_magn_out <= bin_magn_buffer;
+            bin_freq_out <= bin_freq_buffer;
+            bin_addr <= bin_addr + 1;
+            if(current_index[31:16] == 511) current_index <= 0;
+            else current_index <= current_index + 17'h10000;
+        end
+        get_next_delayed <= get_next;
+    end
+endmodule
+
+module shiftManager(    input clock_27mhz,
+                            input restart,
+                            input start_next_window,
+                            input [3:0] pitch,
+                            output done,
+                            output reg [17:0] real_out,
+                            output reg [17:0] imag_out,
+                            output reg [8:0] addr_out,
+                            output reg data_ready);
+                    
+    reg [4:0] counter;              
+    reg we;
+    reg [9:0] sample_counter = 0;
+    reg running = 0;
+
+    reg signed [31:0] center_frequency;
+    reg signed [63:0] center_freq_prod;
+    reg signed [31:0] frequency_deviation;
+    reg signed [31:0] bin_deviation;
+    reg signed [63:0] bin_dev_prod;
+    reg signed [31:0] bin_dev_osamp;
+    reg signed [63:0] bin_dev_osamp_prod;
+    reg signed [31:0] expct_phase_adv;
+    reg signed [63:0] expct_phase_adv_prod;
+    reg signed [31:0] phase, sum_phase;
+    reg [63:0] theta_prod;
+    wire signed [17:0] sin_phase, cos_phase;
+    
+    reg signed [49:0] real_part;
+    reg signed [49:0] imag_part;
+
+    parameter freq_per_bin = 32'sb0_1011_1011_1000_0000_0000; //11.71785
+    parameter freq_per_bin_inv = 32'sb0_0001_0101_1101_1000;
+    parameter pi_one_half = 32'sb0001_1001_0010_0001_1111; //oversampling factor && expected phase advance
+    parameter inv_two_pi = 32'sb0000_0010_1000_1011_1110;
+    wire signed [17:0] neg_inv_two_pi;
+    assign neg_inv_two_pi = -32'sd1 * inv_two_pi;
+    
+    reg [31:0] abs_theta;
+    reg signed [31:0] theta_in_pi_range;
+    reg signed [63:0] producta;         //for storing a product with overflow bits
+    reg signed [63:0] productb;         //for storing a product with overflow bits
+    reg [31:0] qpd;                         //nearest multiple of pi
+    reg signed [31:0] offset;
+    reg signed [63:0] cos_index;
+    reg signed [31:0] cos_index_temp;
+    reg signed [31:0] cos_in;
+    reg signed [31:0] new_theta;
+    parameter PI = 32'b11_0010_0100_0011_1111;
+    parameter two_PI = 32'b11_0010_0100_0011_11110;
+    parameter inv_PI = 32'h0000517C;
+    
+    reg get_next;
+    wire signed [31:0] frequency, magnitude, index;
+    reg signed [31:0] magnitude_unscaled;
+    pitchShift pshft(.pitch(4'b0),
+                    .clock_27M(clock_27mhz),
+                    .get_next(get_next),
+                    .restart(restart),
+                    .new_bin_freq(frequency),                                   
+                    .new_bin_magn(magnitude),                                           
+                    .new_bin_index(index));
+    
+    wire signed [31:0] magn_sum_out_buff, phase_sum_out_buff;
+    reg signed [31:0] magn_sum_out, phase_sum_out, magn_sum_in, phase_sum_in;
+    reg signed [31:0] magn_sum_in_buff, phase_sum_in_buff;
+    reg write_data;
+    wire [8:0] addr;
+    assign addr = index[24:16];
+    
+    ram32x512 magnSumMem(.clka(clock_27mhz),
+                                .dina(magn_sum_in_buff),
+                                .addra(addr),
+                                .wea(write_data),
+                                .douta(magn_sum_out_buff));
+                                
+    ram32x512 phasSumMem(.clka(clock_27mhz),
+                                .dina(phase_sum_in_buff),
+                                .addra(addr),
+                                .wea(write_data),
+                                .douta(phase_sum_out_buff));
+    
+    wire nd, rfd, rdy;
+    assign nd = counter == 10;
+    cosine cos(.THETA(cos_in[31:16]),
+                    .CLK(clock_27mhz),
+                    .ND(nd),
+                    .RFD(rfd),
+                    .RDY(rdy),
+                    .SINE(sin_phase),
+                    .COSINE(cos_phase));
+    
+    assign done = (sample_counter == 512);
+    always @(*) begin
+        magn_sum_in = magnitude + magn_sum_out;
+        
+        center_freq_prod = freq_per_bin * index;
+        center_frequency = center_freq_prod >>> 16;
+        frequency_deviation = frequency - center_frequency;
+        
+        bin_dev_prod = frequency_deviation * freq_per_bin_inv;
+        bin_deviation = bin_dev_prod >>> 16;
+        
+        bin_dev_osamp_prod = bin_deviation * pi_one_half;
+        bin_dev_osamp = bin_dev_osamp_prod >>> 16;
+        
+        expct_phase_adv_prod = index * pi_one_half;
+        expct_phase_adv = expct_phase_adv_prod >>> 16;
+        phase = bin_dev_osamp + expct_phase_adv + phase_sum_out;
+        
+        
+        //map phase to 0-2pi interval
+        if(phase < 0) abs_theta = (-32'sd1 * phase);
+        else abs_theta = phase;
+        producta = abs_theta * inv_PI;
+        qpd = {producta[47:32],16'b0};                              //nearest integer multiple of pi
+        offset = qpd + (qpd&32'h10000);                         //must subtract a multiple of 2*pi
+        productb = PI*offset;
+        if(phase >= 0) theta_in_pi_range = phase - (productb>>>16);
+        else theta_in_pi_range = phase + (productb>>>16);
+        if (theta_in_pi_range >= 0) cos_index_temp = theta_in_pi_range; 
+        else cos_index_temp = two_PI + theta_in_pi_range;   
+        cos_index = cos_index_temp * inv_two_pi;
+        cos_in = cos_index[31:0];
+        
+        //shift by 3 to accomodate magnitude scaling
+        real_part = (magn_sum_in * cos_phase) >>> 4;
+        imag_part = (magn_sum_in * sin_phase) >>> 4;
+        phase_sum_in = phase;
+
+        get_next = running & counter == 0;
+        if(we & index[31:16] < 512) write_data = 1;
+        else write_data = 0;
+        
+    end
+    
+    always @(posedge clock_27mhz) begin
+        if(restart) begin
+            counter <= 5'd0;
+            we <= 0;
+            running <= 0;
+            sample_counter <= 0;
+            data_ready <= 0;
+        end
+        else if(start_next_window) begin
+            running <= 1;
+            sample_counter <= 0;
+            counter <= 5'd0;
+            data_ready <= 0;
+        end
+        else if(running) begin
+            counter <= counter + 1;
+            if (sample_counter == 10'd512) begin running <= 0;
+                data_ready <= 0; end
+            else if(counter == 8 || counter == 10) begin we <= ~we;
+                data_ready <= 0; end
+            else if(counter == 30) begin sample_counter <= sample_counter + 1;
+                data_ready <= 0; end
+                
+            else if (index[31:16] < 512) begin
+                if(counter == 3) begin
+                    magn_sum_out <= magn_sum_out_buff;
+                    phase_sum_out <= phase_sum_out_buff;
+                end else if(counter == 5) begin
+                    phase_sum_in_buff <= phase_sum_in;
+                    magn_sum_in_buff <= magn_sum_in;
+                    data_ready <= 1;
+                    imag_out <= imag_part[33:16];
+                    real_out <= real_part[33:16];
+                    addr_out <= addr;
+                end else data_ready <= 0;
+            end 
+            else data_ready <= 0;
+        end
+    end
+endmodule
+
+module playback(input play, 
+                input clock_27mhz, 
+                input reset, 
+                input [3:0] pitch,
+                output reg note_done,
+                output reg samples_ready,
+                output reg [9:0] addr_out,
+                output reg [5:0] window_counter,
+                output reg [17:0] sample);
+    
+//    reg [5:0] window_counter;
+    wire data_ready;
+    wire [17:0] real_in;
+    wire [17:0] imag_in;
+    wire [8:0] addr_in;
+    wire done_shifting;
+    reg restart;
+    wire restart_pulse;
+    reg start_next_window = 0;
+    wire start_next_window_pulse;
+    reg data_write_enable;
+    reg [35:0] data_write_data;
+    
+    shiftManager sm(    .clock_27mhz(clock_27mhz),
+                            .restart(restart_pulse),
+                            .start_next_window(start_next_window_pulse),
+                            .pitch(4'b0),
+                            .done(done_shifting),
+                            .real_out(real_in),
+                            .imag_out(imag_in),
+                            .addr_out(addr_in),
+                            .data_ready(data_ready));
+    
+    pulse_generator start_window(.clock_27mhz(clock_27mhz),
+                                            .signal(start_next_window),
+                                            .pulse(start_next_window_pulse));
+    
+    pulse_generator rst(    .clock_27mhz(clock_27mhz),
+                                .signal(restart),
+                                .pulse(restart_pulse));
+                                
+    wire ready;
+    reg start = 0;
+    wire start_pulse;
+    wire done_ifft;
+    wire [3:0] output_scaling;
+    reg read_enable_out = 0;
+    wire read_valid;
+    wire [35:0] data_out;
+    wire [17:0] data_imag_out, data_real_out;
+    reg [9:0] fft_addr = 0;
+    
+    pulse_generator start_ifft( .clock_27mhz(clock_27mhz),
+                                            .signal(start),
+                                            .pulse(start_pulse));
+                                            
+    fft #(  .Nb(18),
+            .Dp(16),
+            .log_depth(10)) 
+    dut(    .clk(clock_27mhz), 
+            .reset(reset),
+            .ctl_ready(ready),
+            .ctl_start(start_pulse), 
+            .ctl_log_depth(4'd10),
+            .ctl_real_mode(1'b0),
+            .ctl_direction(1'b1),
+            .ctl_done(done_ifft),
+            .ctl_output_scaling(output_scaling),
+            .data_address(fft_addr),
+            .data_read_enable(read_enable_out),
+            .data_read_valid(read_valid),
+            .data_read_data(data_out),
+            .data_write_enable(data_write_enable),
+            .data_write_data(data_write_data));
+
+//    assign data_write_data = {imag_in,real_in};
+    assign data_imag_out = read_valid & read_enable_out ? data_out[35:18] : 18'b0;
+    assign data_real_out = read_valid & read_enable_out ? data_out[17:0] : 18'b0;
+    
+    parameter GETTING_SHIFTED_WINDOW = 3'd0;
+    parameter GETTING_IFFT = 3'd1;
+    parameter READING_IFFT = 3'd2;
+    parameter WAITING = 3'd3;
+
+    reg [1:0] count = 0;
+    reg [1:0] next_count = 0;
+    reg [9:0] addr_incr = 10'd0;
+    reg [2:0] state = WAITING;
+    reg [2:0] next_state;
+    
+    always @(*) begin
+        case(state)
+            GETTING_SHIFTED_WINDOW: begin
+                start_next_window = 0;
+                if (!done_shifting) begin
+                    next_state = GETTING_SHIFTED_WINDOW;
+                    if (data_ready) begin
+                        data_write_enable = 1; 
+                    end
+                    if (data_write_enable) begin
+                        //data_write_data = 0;
+                        if (count == 0) begin
+                            fft_addr = addr_in + 512;
+                            next_count = 1; 
+                            data_write_data = {imag_in, real_in};
+                        end else if (count == 1) begin
+                            fft_addr = 10'd511 - addr_in;
+                            next_count = 2; 
+                            data_write_data = {-32'sd1*imag_in, real_in};
+                        end else if (count == 2) begin
+                            next_count = 3'd0;
+                            data_write_enable = 0; 
+                        end
+                    end 
+                end else next_state = GETTING_IFFT;
+            end
+            GETTING_IFFT: begin
+                if (ready) start = 1;
+                if (start) begin
+                    if(done_ifft) begin
+                        next_state = READING_IFFT;
+                        start = 0;
+                        samples_ready = 1;
+                    end
+                end
+            end          
+            READING_IFFT: begin
+                if (addr_incr < 1023) begin
+                    next_state = READING_IFFT;
+                    addr_out = addr_incr + 512;
+                    sample = data_real_out;
+                end
+                else if (window_counter < 44) begin
+                    next_state = GETTING_SHIFTED_WINDOW;
+                    start_next_window = 1;
+                    samples_ready = 0;
+                end else begin
+                    next_state = WAITING;
+                    samples_ready = 0;
+                end
+                fft_addr = addr_incr;
+            end
+            WAITING: begin
+                if (play) begin
+                    start_next_window = 1;
+                    next_state = GETTING_SHIFTED_WINDOW;
+		            note_done = 0;
+                end else begin
+                    next_state = WAITING;
+                    note_done = 1;
+                end    
+            end
+        endcase
+    end
+    always @(posedge clock_27mhz) begin
+        if (restart <= 1) restart <= 0;
+        if (reset) begin
+            state <= WAITING;
+            count <= 0; 
+            read_enable_out <= 0;
+            restart <= 1;
+            start_next_window <= 0;
+            window_counter <= 0;
+        end else begin
+            count <= next_count;
+            state <= next_state;
+        end
+        
+        if (state == READING_IFFT) begin
+            if (read_valid) addr_incr <= addr_incr + 1;
+            read_enable_out <= 1;
+        end else read_enable_out <= 0;
+        if (next_state == GETTING_SHIFTED_WINDOW & state != GETTING_SHIFTED_WINDOW) 
+            window_counter <= window_counter + 1;
+    end
+endmodule
+    
+module pulse_generator( input clock_27mhz,
+                                input signal, 
+                                output pulse);
+    reg signal_delayed;
+    assign pulse = signal & !signal_delayed;
+    always @(posedge clock_27mhz) begin
+        signal_delayed <= signal;
+    end
+endmodule
+
+module ac97_interface(  input clock_27mhz, 
+                        input samples_ready, 
+                        input [17:0] sample,
+                        input [9:0] sample_number,
+                        input [5:0] window_number);
+
+    wire [15:0] addr;
+    reg [15:0] addr_in, addr_out;
+    reg [17:0] sample_in;
+    wire [17:0] sample_out;
+    reg we;
+    wire [16:0] addr_reference;
+    reg need_next_ac97_out;
+    reg [9:0] counter;
+
+    assign addr = we ? addr_in : addr_out;
+    mybram #(.LOGSIZE(16), .WIDTH(18)) 
+    windows  (   .addr(addr),
+                        .clk(clock_27mhz),
+                        .din(sample_in),
+                        .dout(sample_out),
+                        .we(we));
+    
+    assign addr_reference = window_number * 11'd1024;
+
+    always @(posedge clock_27mhz) begin
+        if(samples_ready) begin
+            we <= 1;
+            sample_in <= sample;
+            addr_in <= addr_reference + sample_number;
+            counter <= 0;
+        end else begin
+            we <= 0;
+            if (counter < 1023) counter <= counter + 1;
+            addr_out <= counter + (window_number - 1)*11'd1024; 
+        end
+    end                     
+    
+endmodule
+
+module glue (input clock_27mhz, input play, input reset);
+
+    wire note_done, samples_ready;
+    wire [17:0] sample;
+    wire [9:0] addr_out;
+    wire [5:0] window_counter;
+    wire [5:0] window_number;
+    assign window_number = window_counter - 1;
+    playback playback(.play(play), 
+                      .clock_27mhz(clock_27mhz), 
+                      .reset(reset), 
+                      .pitch(4'b0),
+                      .note_done(note_done),
+                      .samples_ready(samples_ready),
+                      .addr_out(addr_out),
+                      .sample(sample),
+                      .window_counter(window_counter));
+
+    ac97_interface ac97_interface(  .clock_27mhz(clock_27mhz), 
+                            .samples_ready(samples_ready), 
+                            .sample(sample),
+                            .sample_number(addr_out),
+                            .window_number(window_number));
+endmodule
+                             
+///////////////////////////////////////////////////////////////////////////////
+//
+// Verilog equivalent to a BRAM, tools will infer the right thing!
+// number of locations = 1<<LOGSIZE, width in bits = WIDTH.
+// default is a 16K x 1 memory.
+//
+///////////////////////////////////////////////////////////////////////////////
+
+module mybram #(parameter LOGSIZE=14, WIDTH=1)
+              (input wire [LOGSIZE-1:0] addr,
+               input wire clk,
+               input wire [WIDTH-1:0] din,
+               output reg [WIDTH-1:0] dout,
+               input wire we);
+   // let the tools infer the right number of BRAMs
+   (* ram_style = "block" *)
+   reg [WIDTH-1:0] mem[(1<<LOGSIZE)-1:0];
+   always @(posedge clk) begin
+     if (we) mem[addr] <= din;
+     dout <= mem[addr];
+   end
+endmodule
+// Switch Debounce Module
+// use your system clock for the clock input
+// to produce a synchronous, debounced output
+module debounce #(parameter DELAY=270000)   // .01 sec with a 27Mhz clock
+            (input reset, clock, noisy,
+             output reg clean);
+
+   reg [18:0] count;
+   reg new;
+
+   always @(posedge clock)
+     if (reset)
+       begin
+      count <= 0;
+      new <= noisy;
+      clean <= noisy;
+       end
+     else if (noisy != new)
+       begin
+      new <= noisy;
+      count <= 0;
+       end
+     else if (count == DELAY)
+       clean <= new;
+     else
+       count <= count+1;
+      
+endmodule
+
+
+module fft #(
+    parameter Nb = 18,  //  total number of bits in real number representation
+    parameter Dp = 16,  //  number of bits to the right of the decimal point
+    parameter log_depth = 10,   //  maximum size supported
+    parameter debug_display = 0
+) (
+    input clk,
+    input reset,
+    
+    output reg ctl_ready,
+    input ctl_start,
+    input [3:0] ctl_log_depth,
+    input ctl_real_mode,
+    input ctl_direction,
+    output reg ctl_done,
+    output reg [3:0] ctl_output_scaling,
+    
+    input [log_depth - 1 : 0] data_address,
+    input data_read_enable,
+    output reg data_read_valid,
+    output reg [2 * Nb - 1 : 0] data_read_data,
+    input data_write_enable,
+    input [2 * Nb - 1 : 0] data_write_data
+);
+
+parameter FFT_IDLE = 4'h0;
+parameter FFT_REAL_PREPROCESS = 4'h1;
+parameter FFT_COMPLEX_FFT = 4'h2;
+parameter FFT_REAL_POSTPROCESS = 4'h3;
+parameter FFT_FLUSH = 4'h4;
+
+/*  Scratch memories
+    The "destination" memory is written from the result of the current processing step and read from the main output port
+    The "source" memory is written from the main input port (e.g. time domain data) and read to get values for the current processing step
+*/
+reg scratch_sel;
+
+wire scratch1_write_enable;
+wire [log_depth - 1 : 0] scratch1_write_addr;
+wire [2 * Nb - 1 : 0] scratch1_write_data;
+wire scratch1_read_enable;
+wire [log_depth - 1 : 0] scratch1_read1_addr;
+wire [2 * Nb - 1 : 0] scratch1_read1_data;
+wire [log_depth - 1 : 0] scratch1_read2_addr;
+wire [2 * Nb - 1 : 0] scratch1_read2_data;
+
+wire [2 + 3 * log_depth + 2 * Nb - 1 : 0] scratch1_in;
+wire [4 * Nb - 1 : 0] scratch1_out;
+
+wire scratch2_write_enable;
+wire [log_depth - 1 : 0] scratch2_write_addr;
+wire [2 * Nb - 1 : 0] scratch2_write_data;
+wire scratch2_read_enable;
+wire [log_depth - 1 : 0] scratch2_read1_addr;
+wire [2 * Nb - 1 : 0] scratch2_read1_data;
+wire [log_depth - 1 : 0] scratch2_read2_addr;
+wire [2 * Nb - 1 : 0] scratch2_read2_data;
+
+wire [2 + 3 * log_depth + 2 * Nb - 1 : 0] scratch2_in;
+wire [4 * Nb - 1 : 0] scratch2_out;
+
+/*  Multiplex memory connections: active_scratch is destination.
+    active_scratch = 0 -> scratch1 is active, scratch2 is inactive
+    active_scratch = 1 -> scratch1 is inactive, scratch2 is active
+*/
+reg scratch_src_read_enable;
+reg [log_depth - 1 : 0] scratch_src_read1_addr;
+reg [log_depth - 1 : 0] scratch_src_read2_addr;
+
+reg scratch_src_write_enable;
+reg [log_depth - 1 : 0] scratch_src_write_addr;
+reg [2 * Nb - 1 : 0] scratch_src_write_data;
+
+reg scratch_src_read_enable_muxed;
+reg [log_depth - 1 : 0] scratch_src_read1_addr_muxed;
+reg [log_depth - 1 : 0] scratch_src_read2_addr_muxed;
+
+reg scratch_src_read_valid;
+//  Assign read_valid since Verilog version of ram_dp doesn't do it for us.
+always @(posedge clk) begin
+    scratch_src_read_valid <= scratch_src_read_enable_muxed;
+end
+
+wire [2 * Nb - 1 : 0] scratch_src_read1_data;
+wire [2 * Nb - 1 : 0] scratch_src_read2_data;
+
+reg scratch_dest_write_enable;
+reg [log_depth - 1 : 0] scratch_dest_write_addr;
+reg [2 * Nb - 1 : 0] scratch_dest_write_data;
+
+wire [2 + 3 * log_depth + 2 * Nb - 1 : 0] scratch_src_in;
+wire [4 * Nb - 1 : 0] scratch_src_out;
+wire [2 + 3 * log_depth + 2 * Nb - 1 : 0] scratch_dest_in;
+wire [4 * Nb - 1 : 0] scratch_dest_out;
+
+assign {scratch1_read_enable, scratch1_read1_addr, scratch1_read2_addr, scratch1_write_enable, scratch1_write_addr, scratch1_write_data} = scratch1_in;
+assign scratch1_out = {scratch1_read1_data, scratch1_read2_data};
+assign {scratch2_read_enable, scratch2_read1_addr, scratch2_read2_addr, scratch2_write_enable, scratch2_write_addr, scratch2_write_data} = scratch2_in;
+assign scratch2_out = {scratch2_read1_data, scratch2_read2_data};
+
+assign scratch_src_in = {scratch_src_read_enable_muxed, scratch_src_read1_addr_muxed, scratch_src_read2_addr_muxed, scratch_src_write_enable, scratch_src_write_addr, scratch_src_write_data};
+assign {scratch_src_read1_data, scratch_src_read2_data} = scratch_src_out;
+assign scratch_dest_in = {{(1 + 2 * log_depth){1'b0}}, scratch_dest_write_enable, scratch_dest_write_addr, scratch_dest_write_data};
+//  assign {} = scratch_dest_out;   - nothing to assign, we don't care about scratch_dest_out
+
+assign scratch1_in = scratch_sel ? scratch_src_in : scratch_dest_in;
+assign scratch2_in = scratch_sel ? scratch_dest_in : scratch_src_in;
+assign scratch_dest_out = scratch_sel ? scratch2_out : scratch1_out;
+assign scratch_src_out = scratch_sel ? scratch1_out : scratch2_out;
+
+//  There are physically 2 scratch memories, labeled scratch1 and scratch2.
+ram_dp scratch1(
+    .clk(clk),
+    .reset(reset),
+    .rw_addr(scratch1_write_enable ? scratch1_write_addr : scratch1_read1_addr),
+    .read1_enable(scratch1_read_enable),
+    .read1_data(scratch1_read1_data),
+    .write_enable(scratch1_write_enable),
+    .write_data(scratch1_write_data),
+    .read2_addr(scratch1_read2_addr),
+    .read2_enable(scratch1_read_enable),
+    .read2_data(scratch1_read2_data)
+);
+defparam scratch1.M = log_depth;
+defparam scratch1.Nb = 2 * Nb;
+
+ram_dp scratch2(
+    .clk(clk),
+    .reset(reset),
+    .rw_addr(scratch2_write_enable ? scratch2_write_addr : scratch2_read1_addr),
+    .read1_enable(scratch2_read_enable),
+    .read1_data(scratch2_read1_data),
+    .write_enable(scratch2_write_enable),
+    .write_data(scratch2_write_data),
+    .read2_addr(scratch2_read2_addr),
+    .read2_enable(scratch2_read_enable),
+    .read2_data(scratch2_read2_data)
+);
+defparam scratch2.M = log_depth;
+defparam scratch2.Nb = 2 * Nb;
+
+//  Twiddle parameters (sin/cos table)
+//  TODO: The size of the ROM can be cut down substantially by
+//  adding some wrapper logic to use only [0, pi/2] and maybe only 1 of sin/cos.
+
+reg twiddle_read_enable;
+reg [log_depth - 1 : 0] twiddle_read_address;
+wire [2 * Nb - 1 : 0] twiddle_read_data;
+wire twiddle_read_valid;
+
+twiddle_lut #(
+    .word_size(Nb * 2),
+    .log_depth(log_depth)
+) twiddle_rom(
+    .clk(clk),
+    .reset(reset),
+    .read_address(twiddle_read_address),
+    .read_enable(twiddle_read_enable),
+    .read_valid(twiddle_read_valid),
+    .read_data(twiddle_read_data)
+);
+
+/*  State variables */
+reg [3:0] state;
+reg [3:0] state_next;
+reg [log_depth : 0] level;
+reg [log_depth : 0] counter;
+reg [log_depth : 0] read_counter;
+
+integer cur_log_depth;
+reg cur_direction;
+reg cur_real_mode;
+integer cur_output_scaling;
+
+integer M;
+integer M_fft;
+
+reg scale_current_stage;
+reg scale_next_stage;
+
+/*  Tasks and functions */
+
+function signed [Nb - 1 : 0] fp_mult(input reg signed [Nb - 1 : 0] x, input reg signed [Nb - 1 : 0] y);
+    reg signed [Nb * 2 - 1 : 0] prod;
+    reg signed [Nb * 2 - 1 : 0] prod_limit;
+begin
+    prod = x * y;
+    prod_limit = 0;
+    prod_limit[Nb + Dp - 1] = 1;
+    if (prod > prod_limit)
+        fp_mult = ((1 << (Nb - 1)) - 1);
+    else
+        fp_mult = (prod >> Dp);
+end
+endfunction
+
+function [2 * Nb - 1 : 0] complex_mult(input reg [2 * Nb - 1 : 0] x, input reg [2 * Nb - 1 : 0] y);
+    reg signed [Nb - 1 : 0] result_real;
+    reg signed [Nb - 1 : 0] result_imag;
+    reg [2 * Nb - 1 : 0] result;
+begin
+    result_real = fp_mult(x[0 +: Nb], y[0 +: Nb]) - fp_mult(x[Nb +: Nb], y[Nb +: Nb]);
+    result_imag = fp_mult(x[0 +: Nb], y[Nb +: Nb]) + fp_mult(x[Nb +: Nb], y[0 +: Nb]);
+    result[0 +: Nb] = result_real;
+    result[Nb +: Nb] = result_imag;
+    complex_mult = result;
+end
+endfunction
+
+function [2 * Nb - 1 : 0] complex_add(input reg [2 * Nb - 1 : 0] x, input reg [2 * Nb - 1 : 0] y);
+    reg signed [Nb - 1 : 0] x_real;
+    reg signed [Nb - 1 : 0] x_imag;
+    reg signed [Nb - 1 : 0] y_real;
+    reg signed [Nb - 1 : 0] y_imag;
+    reg [2 * Nb - 1 : 0] result;
+begin
+    x_real = x[0 +: Nb];
+    x_imag = x[Nb +: Nb];
+    y_real = y[0 +: Nb];
+    y_imag = y[Nb +: Nb];
+    result[0 +: Nb] = x_real + y_real;
+    result[Nb +: Nb] = x_imag + y_imag;
+    complex_add = result;
+end
+endfunction
+
+function [2 * Nb - 1 : 0] complex_subtract(input reg [2 * Nb - 1 : 0] x, input reg [2 * Nb - 1 : 0] y);
+    reg [2 * Nb - 1 : 0] result;
+begin
+    result[0 +: Nb] = x[0 +: Nb] - y[0 +: Nb];
+    result[Nb +: Nb] = x[Nb +: Nb] - y[Nb +: Nb];
+    complex_subtract = result;
+end
+endfunction
+
+function [2 * Nb - 1 : 0] conj(input reg [2 * Nb - 1 : 0] x);
+    reg signed [Nb - 1 : 0] x_real;
+    reg signed [Nb - 1 : 0] x_imag;
+    reg [2 * Nb - 1 : 0] result;
+begin
+    x_real = x[0 +: Nb];
+    x_imag = x[Nb +: Nb];
+    result[0 +: Nb] = x_real;
+    result[Nb +: Nb] = -x_imag;
+    conj = result;
+end
+endfunction
+
+function needs_scaling_real(input reg signed [Nb - 1 : 0] x);
+    reg signed [Nb - 1 : 0] x_max;
+    reg signed [Nb - 1 : 0] x_min;
+begin
+    x_max = (1 << Dp);
+    x_min = -(1 << Dp);
+    //  if (debug_display) $display("%t: FFT needs_scaling_real: comparing value %h to max %h and min %h", $time, x, x_max, x_min);
+    needs_scaling_real = (x >= x_max) || (x <= x_min);
+end
+endfunction
+
+function needs_scaling(input reg [2 * Nb - 1 : 0] x);
+    needs_scaling = (needs_scaling_real(x[0 +: Nb]) || needs_scaling_real(x[Nb +: Nb]));
+endfunction
+
+function needs_scaling_input(input reg [63 : 0] x);
+    reg signed [Nb - 1 : 0] xr;
+    reg signed [Nb - 1 : 0] xi;
+begin
+    xr = x[0 +: Nb];
+    xi = x[32 +: Nb];
+    //  if (debug_display) $display("%t FFT needs_scaling_input: real = %h (%d) imag = %h (%d)", $time, xr, needs_scaling_real(xr), xi, needs_scaling_real(xi));
+    needs_scaling_input = (needs_scaling_real(xr) || needs_scaling_real(xi));
+end
+endfunction
+
+function [2 * Nb - 1 : 0] scale_if_necessary(input reg [2 * Nb - 1 : 0] x);
+    reg signed [Nb - 1 : 0] x_real;
+    reg signed [Nb - 1 : 0] x_imag;
+    reg [2 * Nb - 1 : 0] result;
+begin
+    x_real = x[0 +: Nb];
+    x_imag = x[Nb +: Nb];
+    if (scale_current_stage) begin
+        result[0 +: Nb] = x_real >>> 1;
+        result[Nb +: Nb] = x_imag >>> 1;
+    end
+    else begin
+        result[0 +: Nb] = x_real;
+        result[Nb +: Nb] = x_imag;
+    end
+    scale_if_necessary = result;
+end
+endfunction
+
+task request_preprocess(input integer count);
+    reg [log_depth : 0] read1_addr;
+    reg [log_depth : 0] read2_addr;
+begin
+    read1_addr = count * 2;
+    read2_addr = count * 2 + 1;
+
+    scratch_src_read1_addr <= read1_addr;
+    scratch_src_read2_addr <= read2_addr;
+    scratch_src_read_enable <= 1;
+    
+    //  if (debug_display) $display("%t FFT request_preprocess counter = %d addr1 = %d addr2 = %d", $time, count, read1_addr, read2_addr);
+end
+endtask
+
+task run_preprocess(input integer count);
+    reg [2 * Nb - 1 : 0] z1;
+    reg [2 * Nb - 1 : 0] z2;
+    reg [2 * Nb - 1 : 0] result;
+begin
+    z1 = scale_if_necessary(scratch_src_read1_data);
+    z2 = scale_if_necessary(scratch_src_read2_data);
+    result[0 +: Nb] = z1[0 +: Nb];
+    result[Nb +: Nb] = z2[0 +: Nb];
+
+    scratch_dest_write_addr <= count;
+    scratch_dest_write_enable <= 1;
+    scratch_dest_write_data <= result;
+end
+endtask
+
+task request_complex_fft(input integer count);
+    reg [log_depth : 0] addr_A;
+     reg [log_depth : 0] addr_A_base;
+     reg [log_depth : 0] addr_A_var;
+    reg [log_depth : 0] addr_B;
+    reg [log_depth : 0] addr_diff;
+    reg [log_depth : 0] mask;
+    reg [log_depth : 0] twiddle_addr;
+     integer i;
+begin
+    mask = ~(((1 << M_fft) - 1) >> (level)) >> 1;
+    addr_diff = (1 << (M_fft - level - 1));
+
+    //  addr_A = ((count % (1 << (M_fft - 1)) & mask) << 1) + (count % (1 << (M_fft - level - 1)));
+    //      Compute addr_A without modulo operator
+    addr_A_var = counter;
+    addr_A_base = counter;
+    for (i = 0; i < log_depth; i = i + 1) begin
+        if (i >= M_fft - level - 1)
+            addr_A_var[i] = 0;
+        if (i >= M_fft - 1)
+            addr_A_base[i] = 0;
+    end
+    addr_A = ((addr_A_base & mask) << 1) + addr_A_var;
+    addr_B = addr_A + addr_diff;
+
+    twiddle_addr = (counter >> (M_fft - level - 1)) << (log_depth - level - 1);
+    
+    twiddle_read_address <= twiddle_addr;
+    twiddle_read_enable <= 1;
+
+    scratch_src_read1_addr <= addr_A;
+    scratch_src_read2_addr <= addr_B;
+    scratch_src_read_enable <= 1;
+    
+    if (debug_display) $display("%t FFT request_complex_fft counter = %d addr_A = %d addr_B = %d twiddle = %d", $time, count, addr_A, addr_B, twiddle_addr);
+end
+endtask
+
+task run_complex_fft(input integer count);
+    reg [2 * Nb - 1 : 0] dest_val;
+    reg [2 * Nb - 1 : 0] src_a;
+    reg [2 * Nb - 1 : 0] src_b;
+    reg [2 * Nb - 1 : 0] twiddle_b;
+    reg [2 * Nb - 1 : 0] src_b_twiddled;
+    reg [2 * Nb - 1 : 0] result;
+    
+begin
+    src_a = scale_if_necessary(scratch_src_read1_data);
+    src_b = scale_if_necessary(scratch_src_read2_data);
+    twiddle_b = cur_direction ? conj(twiddle_read_data) : twiddle_read_data;
+    src_b_twiddled = complex_mult(src_b, twiddle_b);
+    result = complex_add(src_a, src_b_twiddled);
+    
+    if (needs_scaling(result))
+        scale_next_stage <= 1;
+        
+    scratch_dest_write_addr <= count;
+    scratch_dest_write_enable <= 1;
+    scratch_dest_write_data <= result;
+    
+    if (debug_display) $display("%t FFT run_complex_fft counter = %d src_a = (%h, %h) src_b = (%h, %h) twiddle_b = (%h, %h), src_b_twiddled = (%h, %h), result = (%h, %h)", $time, count, src_a[0 +: Nb], src_a[Nb +: Nb], src_b[0 +: Nb], src_b[Nb +: Nb], twiddle_b[0 +: Nb], twiddle_b[Nb +: Nb], src_b_twiddled[0 +: Nb], src_b_twiddled[Nb +: Nb], result[0 +: Nb], result[Nb +: Nb]);
+end
+endtask
+
+task request_postprocess(input integer count);
+    reg [log_depth : 0] addr_A;
+    reg [log_depth : 0] addr_B;
+     integer i;
+begin
+    addr_A = count;
+     addr_B = ((1 << M_fft) - count);
+        for (i = 0; i < log_depth; i = i + 1) begin
+            if (i >= M_fft) begin
+                addr_A[i] = 0;
+                addr_B[i] = 0;
+            end
+        end
+    scratch_src_read1_addr <= addr_A;
+    scratch_src_read2_addr <= addr_B;
+    scratch_src_read_enable <= 1;
+    twiddle_read_address <= count << (log_depth - M);
+    twiddle_read_enable <= 1;
+    
+    //  if (debug_display) $display("%t FFT request_postprocess counter = %d addr_A = %d addr_B = %d twiddle = %d", $time, count, addr_A, addr_B, count << (log_depth - M));
+end
+endtask
+
+task run_postprocess(input integer count);
+    reg [2 * Nb - 1 : 0] src_a;
+    reg [2 * Nb - 1 : 0] src_b;
+    reg [2 * Nb - 1 : 0] z_sum;
+    reg [2 * Nb - 1 : 0] z_diff;
+    reg [2 * Nb - 1 : 0] w;
+    reg signed [Nb + 1 : 0] result_real_int;  //  extra bits to prevent intermediate overflow
+    reg signed [Nb + 1 : 0] result_imag_int;
+    reg signed [Nb + 1 : 0] result_real;
+    reg signed [Nb + 1 : 0] result_imag;
+    reg [2 * Nb - 1 : 0] result;
+
+begin
+    src_a = scale_if_necessary(scratch_src_read1_data);
+    src_b = scale_if_necessary(scratch_src_read2_data);
+    w = cur_direction ? conj(twiddle_read_data) : twiddle_read_data;
+    
+    z_sum = complex_add(src_a, src_b);
+    z_diff = complex_subtract(src_a, src_b);
+    
+    result_real = fp_mult(w[0 +: Nb], z_sum[Nb +: Nb]);
+    result_real = result_real + fp_mult(w[Nb +: Nb], z_diff[0 +: Nb]);
+    result_real_int = result_real + $signed(z_sum[0 +: Nb]);
+    result_real = result_real_int >>> 1;
+    
+    result_imag = - fp_mult(w[0 +: Nb], z_diff[0 +: Nb]);
+    result_imag = result_imag + fp_mult(w[Nb +: Nb], z_sum[Nb +: Nb]);
+    result_imag_int = result_imag + $signed(z_diff[Nb +: Nb]);
+    result_imag = result_imag_int >>> 1;
+    
+    result[0 +: Nb] = result_real;
+    result[Nb +: Nb] = result_imag;
+
+    scratch_dest_write_addr <= count;
+    scratch_dest_write_enable <= 1;
+    scratch_dest_write_data <= result;
+    
+    if (debug_display) $display("%t FFT run_postprocess counter = %d src_a = (%h, %h) src_b = (%h, %h) result = (%h, %h)", $time, count, src_a[0 +: Nb], src_a[Nb +: Nb], src_b[0 +: Nb], src_b[Nb +: Nb], result[0 +: Nb], result[Nb +: Nb]);
+end
+endtask
+
+task update_scaling;
+    integer scale_bits_updated;
+begin
+    scale_current_stage <= scale_next_stage;
+    scale_next_stage <= 0;
+    
+    scale_bits_updated = scale_next_stage ? cur_output_scaling + 1 : cur_output_scaling;
+    cur_output_scaling <= scale_bits_updated;
+    
+    if (debug_display) $display("%t FFT update_scaling: current stage scale flag is %d, total bits scaling = %d", $time, scale_next_stage, scale_bits_updated);
+end
+endtask
+
+
+/*  Combinational logic */
+always @(*) begin
+    M = cur_log_depth;
+    M_fft = cur_real_mode ? M - 1 : M;
+
+    if (state == FFT_IDLE) begin
+        data_read_valid = scratch_src_read_valid;
+        data_read_data = scratch_src_read1_data;
+        
+        scratch_src_write_enable = data_write_enable;
+        scratch_src_write_addr = data_address;
+        scratch_src_write_data = data_write_data;
+        
+        scratch_src_read_enable_muxed = data_read_enable;
+        scratch_src_read1_addr_muxed = data_address;
+        scratch_src_read2_addr_muxed = 0;
+    end
+    else begin
+        data_read_valid = 0;
+        data_read_data = 0;
+        
+        scratch_src_write_enable = 0;
+        scratch_src_write_addr = 0;
+        scratch_src_write_data = 0;
+        
+        scratch_src_read_enable_muxed = scratch_src_read_enable;
+        scratch_src_read1_addr_muxed = scratch_src_read1_addr;
+        scratch_src_read2_addr_muxed = scratch_src_read2_addr;
+    end
+end
+
+//  Sequential logic
+always @(posedge clk) if (reset) begin
+
+    //  Initialize control interface
+    ctl_ready <= 0;
+    ctl_done <= 0;
+    ctl_output_scaling <= 0;
+
+    //  Initialize internal state
+    level <= 0;
+    counter <= 0;
+    read_counter <= 0;
+    scratch_sel <= 0;
+    
+    cur_log_depth <= 0;
+    cur_real_mode <= 0;
+    cur_direction <= 0;
+    cur_output_scaling <= 0;
+    
+    scale_current_stage <= 0;
+    scale_next_stage <= 0;
+    
+    state <= FFT_IDLE;
+    state_next <= FFT_IDLE;
+    
+    scratch_src_read1_addr <= 0;
+    scratch_src_read_enable <= 0;
+    scratch_src_read2_addr <= 0;
+
+    scratch_dest_write_addr <= 0;
+    scratch_dest_write_enable <= 0;
+    scratch_dest_write_data <= 0;
+
+    twiddle_read_address <= 0;
+    twiddle_read_enable <= 0;
+end
+else begin
+
+    //  Default interface state
+    ctl_ready <= 0;
+    ctl_done <= 0;
+        
+    scratch_src_read_enable <= 0;
+    scratch_dest_write_enable <= 0;
+    
+    twiddle_read_enable <= 0;
+    
+    case (state)
+
+    FFT_IDLE: begin
+        counter <= 0;
+        read_counter <= 0;
+        
+        ctl_ready <= 1;
+        cur_output_scaling <= 0;
+        
+        if (ctl_ready && ctl_start) begin
+            ctl_ready <= 0;
+            cur_log_depth <= ctl_log_depth;
+            cur_direction <= ctl_direction;
+            cur_real_mode <= ctl_real_mode;
+
+            update_scaling;
+            if (ctl_real_mode)
+                state <= FFT_REAL_PREPROCESS;
+            else
+                state <= FFT_COMPLEX_FFT;
+        end 
+        
+        //  Watch for input that will need scaling during either preprocessing or first FFT stage
+        if (data_write_enable && needs_scaling_input(data_write_data))
+            scale_next_stage <= 1;
+    end
+    
+    FFT_REAL_PREPROCESS: begin
+    
+        if (scratch_src_read_valid) begin
+            run_preprocess(read_counter);
+            if (read_counter < (1 << M_fft) - 1)
+                read_counter <= read_counter + 1;
+            else begin
+                state_next <= FFT_COMPLEX_FFT;
+                state <= FFT_FLUSH;
+            end
+        end
+
+        if (counter <= (1 << M_fft) - 1) begin
+            request_preprocess(counter);
+            counter <= counter + 1;
+        end
+    end
+    
+    FFT_COMPLEX_FFT: begin
+    
+        if (scratch_src_read_valid) begin
+            run_complex_fft(read_counter);
+            if (read_counter == (1 << M_fft) - 1) begin
+                state <= FFT_FLUSH;
+                if (level == M_fft - 1) begin
+                    level <= 0;
+                    if (cur_real_mode)
+                        state_next <= FFT_REAL_POSTPROCESS;
+                    else begin
+                        ctl_output_scaling <= cur_output_scaling;
+                        ctl_done <= 1;
+                        state_next <= FFT_IDLE;
+                    end
+                end
+                else begin
+                    level <= level + 1;
+                    state_next <= FFT_COMPLEX_FFT;
+                end
+            end
+            else
+                read_counter <= read_counter + 1;
+        end
+        
+        if (counter <= (1 << M_fft) - 1) begin
+            request_complex_fft(counter);
+            counter <= counter + 1;
+        end
+
+    end
+    
+    FFT_REAL_POSTPROCESS: begin
+        if (scratch_src_read_valid) begin
+            run_postprocess(read_counter);
+            
+            if (read_counter == (1 << M) - 1) begin
+                ctl_output_scaling <= cur_output_scaling;
+                ctl_done <= 1;
+                state <= FFT_FLUSH;
+                state_next <= FFT_IDLE;
+            end
+            else
+                read_counter <= read_counter + 1;
+        end
+
+        if (counter <= (1 << M) - 1) begin
+            request_postprocess(counter);
+            counter <= counter + 1;
+        end
+
+    end
+    
+    FFT_FLUSH: begin
+        counter <= 0;
+        read_counter <= 0;
+        update_scaling;
+        state <= state_next;
+        scratch_sel <= !scratch_sel;
+    end
+    
+    endcase
+
+end
+
+
+endmodule
